@@ -1,6 +1,7 @@
 from scrapy import signals
 from scrapy.exceptions import DontCloseSpider
 from scrapy.spiders import Spider, CrawlSpider
+from twisted.internet import task
 
 from . import connection, defaults
 from .utils import bytes_to_str
@@ -70,7 +71,7 @@ class RedisMixin(object):
         self.server = connection.from_settings(crawler.settings)
         # The idle signal is called when the spider has no requests left,
         # that's when we will schedule new requests from redis queue
-        crawler.signals.connect(self.spider_idle, signal=signals.spider_idle)
+        crawler.signals.connect(self.spider_opened, signal=signals.spider_opened)
 
     def next_requests(self):
         """Returns a request to be scheduled or none."""
@@ -115,7 +116,7 @@ class RedisMixin(object):
         for req in self.next_requests():
             self.crawler.engine.crawl(req, spider=self)
 
-    def spider_idle(self):
+    def spider_opened(self):
         """Schedules a request if available, otherwise waits."""
         # XXX: Handle a sentinel to close the spider.
         self.schedule_next_requests()
@@ -149,13 +150,22 @@ class RedisSpider(RedisMixin, Spider):
     """
 
     @classmethod
-    def from_crawler(self, crawler, *args, **kwargs):
-        obj = super(RedisSpider, self).from_crawler(crawler, *args, **kwargs)
+    def from_crawler(cls, crawler, *args, **kwargs):
+        obj = super(RedisSpider, cls).from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(obj.spider_opened, signal=signals.spider_opened)
         obj.setup_redis(crawler)
         return obj
 
+    def spider_opened(self):
+        interval = self.settings.getfloat('REDIS_INTERVAL')
+        self.task = task.LoopingCall(self.schedule_continuous_requests, self)
+        self.task.start(interval)
 
-class RedisCrawlSpider(RedisMixin, CrawlSpider):
+    def schedule_continuous_requests(self, spider):
+        self.logger.info('scheduling more requests')
+
+
+class RedisCrawlSpider(RedisSpider, CrawlSpider):
     """Spider that reads urls from redis queue when idle.
 
     Attributes
@@ -179,9 +189,3 @@ class RedisCrawlSpider(RedisMixin, CrawlSpider):
         Default encoding to use when decoding messages from redis queue.
 
     """
-
-    @classmethod
-    def from_crawler(self, crawler, *args, **kwargs):
-        obj = super(RedisCrawlSpider, self).from_crawler(crawler, *args, **kwargs)
-        obj.setup_redis(crawler)
-        return obj
